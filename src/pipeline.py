@@ -1,4 +1,9 @@
-"""Chạy toàn bộ pipeline: ETL -> trạng thái -> đồ thị -> đặc trưng -> huấn luyện."""
+"""Chạy pipeline: ETL -> trạng thái -> đồ thị -> đặc trưng -> huấn luyện.
+
+python pipeline.py                chạy cả 5 bước
+python pipeline.py --step TÊN     chạy đúng một bước (Airflow dùng cách này)
+python pipeline.py --clear-done | --mark-done
+"""
 
 import os
 import sys
@@ -9,63 +14,66 @@ import s2_state
 import s3_graph
 import s4_features
 import s5_train
-from config import DATA_DIR, OUT_DIR, log
+from config import OUT_DIR, log
 
+STEPS = {
+    "s1_etl": s1_etl,
+    "s2_state": s2_state,
+    "s3_graph": s3_graph,
+    "s4_features": s4_features,
+    "s5_train": s5_train,
+}
+# Dấu hoàn tất: app chỉ khởi động khi file này có đúng phiên bản dưới đây.
 DONE = os.path.join(OUT_DIR, "_pipeline_done")
-PIPELINE_VERSION = "research-behavior-v2"
-
-REQUIRED = [
-    "securities_master.csv",
-    "stock_market_daily.csv",
-    "market_index_daily.csv",
-    "customer_profile.csv",
-    "customer_transactions_raw.csv",
-    "customer_holdings.csv",
-    "candidate_stocks_research.csv",
-]
+PIPELINE_VERSION = "phs-v6-day"
 
 
-def check_data():
-    """Báo sớm và rõ nếu thiếu file CSV, thay vì để lỗi khó hiểu ở giữa pipeline."""
-    missing = [f for f in REQUIRED if not os.path.exists(os.path.join(DATA_DIR, f))]
-    if not missing:
-        return
-    log(
-        "pipeline",
-        f"THIẾU {len(missing)}/{len(REQUIRED)} file dữ liệu trong thư mục data/:",
-    )
-    for f in missing:
-        log("pipeline", f"    - {f}")
-    log("pipeline", "Đặt đủ 7 file CSV vào thư mục data/ rồi chạy lại:")
-    log("pipeline", "    docker compose restart app")
-    sys.exit(1)
+def is_done() -> bool:
+    try:
+        with open(DONE, encoding="utf-8") as f:
+            return f.read().strip().split("|")[0] == PIPELINE_VERSION
+    except OSError:
+        return False
 
 
-def run(force: bool = False):
-    if os.path.exists(DONE) and not force:
-        try:
-            with open(DONE, encoding="utf-8") as f:
-                done_version = f.read().strip().split("|")[0]
-        except OSError:
-            done_version = ""
-        if done_version == PIPELINE_VERSION:
-            log(
-                "pipeline",
-                "đã chạy đúng phiên bản hiện tại — bỏ qua "
-                "(xoá artifacts/_pipeline_done để chạy lại).",
-            )
-            return
-        log("pipeline", "artifacts thuộc phiên bản cũ — tự chạy lại pipeline.")
-    check_data()
-    t0 = time.time()
-    for step in (s1_etl, s2_state, s3_graph, s4_features, s5_train):
-        s = time.time()
-        step.main()
-        log("pipeline", f"{step.__name__} xong sau {time.time() - s:.0f}s")
+def wait_until_done(poll_seconds: int = 15):
+    """App gọi hàm này lúc khởi động: CHỜ pipeline chạy xong chứ không tự chạy."""
+    if not is_done():
+        log("pipeline", "chưa có kết quả — app CHỜ. Bấm DAG pipeline_khuyen_nghi.")
+    while not is_done():
+        time.sleep(poll_seconds)
+
+
+def mark_done():
     with open(DONE, "w", encoding="utf-8") as f:
         f.write(f"{PIPELINE_VERSION}|{time.time()}")
-    log("pipeline", f"HOÀN TẤT sau {(time.time() - t0) / 60:.0f} phút")
+
+
+def clear_done():
+    """Xoá dấu trước khi chạy lại: lần chạy hỏng giữa chừng không bị coi là hợp lệ."""
+    if os.path.exists(DONE):
+        os.remove(DONE)
+
+
+def run_step(name: str):
+    start = time.time()
+    STEPS[name].main()
+    log("pipeline", f"{name} xong sau {time.time() - start:.0f}s")
+
+
+def main(argv):
+    if "--clear-done" in argv:
+        clear_done()
+    elif "--mark-done" in argv:
+        mark_done()
+    elif "--step" in argv:
+        run_step(argv[argv.index("--step") + 1])
+    else:
+        clear_done()
+        for name in STEPS:
+            run_step(name)
+        mark_done()
 
 
 if __name__ == "__main__":
-    run(force="--force" in sys.argv)
+    main(sys.argv[1:])
